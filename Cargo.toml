@@ -1,0 +1,12 @@
+[package]
+name = "unique-id-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+dotenvy = "0.15"
+nanoid = "0.4"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
