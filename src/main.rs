@@ -1,3 +1,4 @@
+use anyhow::{Context, anyhow};
 use axum::{
     Router,
     extract::State,
@@ -5,13 +6,21 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use nanoid::nanoid;
-use sqlx::{Pool, Postgres, postgres::PgPoolOptions};
-use std::{env, sync::Arc};
+use nanoid::{alphabet::HEX_LOWERCASE, nanoid};
+use std::{
+    collections::HashSet,
+    env,
+    fs::File,
+    io::{BufRead, BufReader, Write as _},
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::net::TcpListener;
 
 struct AppState {
-    pool: Pool<Postgres>,
+    ids: HashSet<String>,
+    store: File,
 }
 
 struct AppError(anyhow::Error);
@@ -30,21 +39,23 @@ impl<E: Into<anyhow::Error>> From<E> for AppError {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    match dotenvy::dotenv() {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if e.not_found() {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }?;
-    let state = Arc::new(AppState {
-        pool: PgPoolOptions::new()
-            .connect(&env::var("DATABASE_URL")?)
-            .await?,
-    });
+    let store = File::options()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(
+            Path::new(
+                &env::var("STATE_DIRECTORY")
+                    .context("failed to read environment variable `STATE_DIRECTORY`")?,
+            )
+            .join("store"),
+        )
+        .context("failed to open the store file")?;
+    let ids = BufReader::new(&store)
+        .lines()
+        .collect::<Result<_, _>>()
+        .context("failed to read store")?;
+    let state = Arc::new(Mutex::new(AppState { ids, store }));
     let app = Router::new()
         .route("/id", get(generate_id))
         .with_state(state);
@@ -55,23 +66,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-const DIRECTORY: [char; 16] = [
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-];
-
-async fn generate_id(State(state): State<Arc<AppState>>) -> Result<String, AppError> {
-    let mut id;
-    loop {
-        id = nanoid!(10, &DIRECTORY);
-        let ids = sqlx::query!("SELECT COUNT(*) FROM ids WHERE id = $1", id)
-            .fetch_one(&state.pool)
-            .await?;
-        if ids.count.unwrap() == 0 {
-            break;
+async fn generate_id(State(state): State<Arc<Mutex<AppState>>>) -> Result<String, AppError> {
+    let AppState { ids, store } = &mut *state.lock().unwrap();
+    let end = Instant::now() + Duration::from_secs(2);
+    while Instant::now() <= end {
+        let id = nanoid!(1, &HEX_LOWERCASE);
+        if ids.insert(id.clone()) {
+            writeln!(store, "{id}")?;
+            return Ok(id);
         }
     }
-    sqlx::query!("INSERT INTO ids (id) VALUES ($1)", id)
-        .execute(&state.pool)
-        .await?;
-    Ok(id)
+    Err(AppError(anyhow!("generation time exceeded")))
 }
