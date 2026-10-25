@@ -17,13 +17,7 @@ fn main() -> Result<()> {
         .create(true)
         .append(true)
         .read(true)
-        .open(
-            Path::new(
-                &env::var("STATE_DIRECTORY")
-                    .context("failed to read environment variable `STATE_DIRECTORY`")?,
-            )
-            .join("store"),
-        )
+        .open(Path::new(&env::var("STATE_DIRECTORY").unwrap_or_default()).join("store"))
         .context("failed to open the store file")?;
     let mut ids = BufReader::new(&store)
         .lines()
@@ -32,6 +26,8 @@ fn main() -> Result<()> {
 
     let addr = env::var("LISTEN").unwrap_or("127.0.0.1:3000".to_string());
     let socket = UdpSocket::bind(addr).context("failed to bind")?;
+    println!("binding on `{}`", socket.local_addr().unwrap());
+
     let mut buf = [0; 512];
     loop {
         if let Err(e) = handle(&socket, &mut buf, &mut ids, &mut store) {
@@ -47,17 +43,46 @@ fn handle(
     ids: &mut HashSet<String>,
     store: &mut File,
 ) -> Result<()> {
-    let (n, _) = socket.recv_from(buf).context("failed to receive")?;
-    let message = deserialize(&buf[..n])?;
-    dbg!(message);
-    generate_id(ids, store)?;
+    let (n, addr) = socket.recv_from(buf).context("failed to receive")?;
+    let Message {
+        header, question, ..
+    } = deserialize(&buf[..n])?;
+    let id = generate_id(ids, store)?;
+    let question = question.unwrap();
+    let (n, res) = serialize(&Message {
+        header: Header {
+            id: header.id,
+            qr: Type::Response,
+            opcode: header.opcode,
+            aa: true,
+            tc: false,
+            rd: header.rd,
+            ra: false,
+            rcode: 0,
+            qdcount: 1,
+            ancount: 1,
+            nscount: 0,
+            arcount: 0,
+        },
+        question: Some(question.clone()),
+        answer: Some(Record {
+            name: question.qname,
+            r#type: 16,
+            class: question.qclass,
+            ttl: 0,
+            rdlength: u16::try_from(id.len() + 1)
+                .map_err(|_| anyhow!("max resource record data size exceeded"))?,
+            rdata: id,
+        }),
+    })?;
+    socket.send_to(&res[..n], addr)?;
     Ok(())
 }
 
 fn generate_id(ids: &mut HashSet<String>, store: &mut File) -> Result<String> {
     let end = Instant::now() + Duration::from_secs(2);
     while Instant::now() <= end {
-        let id = nanoid!(1, &HEX_LOWERCASE);
+        let id = nanoid!(10, &HEX_LOWERCASE);
         if ids.insert(id.clone()) {
             writeln!(store, "{id}").context("failed to write to store")?;
             store.sync_data().context("failed to sync to store")?;
@@ -71,7 +96,8 @@ fn generate_id(ids: &mut HashSet<String>, store: &mut File) -> Result<String> {
 #[allow(unused)]
 struct Message {
     header: Header,
-    question: Question,
+    question: Option<Question>,
+    answer: Option<Record>,
 }
 
 #[derive(Debug)]
@@ -91,18 +117,28 @@ struct Header {
     arcount: u16,
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 enum Type {
     Query,
     Response,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[allow(unused)]
 struct Question {
     qname: String,
     qtype: u16,
     qclass: u16,
+}
+
+#[derive(Debug)]
+struct Record {
+    name: String,
+    r#type: u16,
+    class: u16,
+    ttl: u32,
+    rdlength: u16,
+    rdata: String,
 }
 
 #[derive(Debug)]
@@ -174,5 +210,80 @@ fn deserialize(raw: &[u8]) -> Result<Message, Error> {
         },
     };
 
-    Ok(Message { header, question })
+    Ok(Message {
+        header,
+        question: Some(question),
+        answer: None,
+    })
+}
+
+fn serialize(
+    Message {
+        header,
+        question,
+        answer,
+    }: &Message,
+) -> Result<(usize, [u8; 512])> {
+    let mut buf = [0; 512];
+    buf[..2].copy_from_slice(&header.id.to_be_bytes());
+    buf[2] = header.rd as u8;
+    buf[2] |= (header.tc as u8) << 1;
+    buf[2] |= (header.aa as u8) << 2;
+    buf[2] |= header.opcode << 3;
+    buf[2] |= (header.qr as u8) << 7;
+    buf[3] = header.rcode;
+    buf[3] |= (header.ra as u8) << 7;
+    buf[4..6].copy_from_slice(&header.qdcount.to_be_bytes());
+    buf[6..8].copy_from_slice(&header.ancount.to_be_bytes());
+
+    let mut i = 12;
+
+    if header.qdcount == 1 {
+        let question = question.as_ref().unwrap();
+        for segment in question
+            .qname
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+        {
+            buf[i] = u8::try_from(segment.len())
+                .map_err(|_| anyhow!("serializing: max domain name segment length exceeded"))?;
+            i += 1;
+            buf[i..i + segment.len()].copy_from_slice(segment.as_bytes());
+            i += segment.len();
+        }
+        buf[i] = 0;
+        i += 1;
+        buf[i..i + 2].copy_from_slice(&question.qtype.to_be_bytes());
+        i += 2;
+        buf[i..i + 2].copy_from_slice(&question.qclass.to_be_bytes());
+        i += 2;
+    }
+
+    if header.ancount > 0 {
+        let answer = answer.as_ref().unwrap();
+        for segment in answer.name.split('.').filter(|segment| !segment.is_empty()) {
+            buf[i] = u8::try_from(segment.len())
+                .map_err(|_| anyhow!("serializing: max domain name segment length exceeded"))?;
+            i += 1;
+            buf[i..i + segment.len()].copy_from_slice(segment.as_bytes());
+            i += segment.len();
+        }
+        buf[i] = 0;
+        i += 1;
+        buf[i..i + 2].copy_from_slice(&answer.r#type.to_be_bytes());
+        i += 2;
+        buf[i..i + 2].copy_from_slice(&answer.class.to_be_bytes());
+        i += 2;
+        buf[i..i + 4].copy_from_slice(&answer.ttl.to_be_bytes());
+        i += 4;
+        buf[i..i + 2].copy_from_slice(&answer.rdlength.to_be_bytes());
+        i += 2;
+        buf[i] =
+            u8::try_from(answer.rdata.len()).map_err(|_| anyhow!("max `RDATA` length exceeded"))?;
+        i += 1;
+        buf[i..i + answer.rdata.len()].copy_from_slice(answer.rdata.as_bytes());
+        i += answer.rdata.len();
+    }
+
+    Ok((i, buf))
 }
