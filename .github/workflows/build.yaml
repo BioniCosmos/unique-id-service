@@ -1,0 +1,60 @@
+name: Build
+on:
+  push:
+    tags: ['*']
+  workflow_dispatch:
+jobs:
+  build:
+    strategy:
+      matrix:
+        target:
+          - runner: ubuntu-latest
+            name: x86_64-unknown-linux-musl
+            pre: true
+            output: linux-x86_64
+          - runner: ubuntu-26.04-arm
+            name: aarch64-unknown-linux-musl
+            pre: true
+            output: linux-aarch64
+          - runner: macos-latest
+            name: aarch64-apple-darwin
+            output: macos-aarch64
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Prerequisites
+        if: matrix.target.pre
+        run: |
+          sudo apt-get -y install musl-tools
+          rustup target add ${{ matrix.target.name }}
+      - name: Cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target.output }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build
+        run: |
+          cargo build -r --target ${{ matrix.target.name }}
+          mv target/${{ matrix.target.name }}/release/unique-id-service uid-${{ matrix.target.output }}
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: uid-${{ matrix.target.output }}
+          path: uid-${{ matrix.target.output }}
+  publish:
+    permissions:
+      contents: write
+    needs: build
+    runs-on: ubuntu-slim
+    steps:
+      - name: Download release artifact
+        uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - name: Publish built binary to GitHub releases
+        run: gh release create -R $GITHUB_REPOSITORY -d --generate-notes $GITHUB_REF_NAME uid-*
+        env:
+          GH_TOKEN: ${{ github.token }}
