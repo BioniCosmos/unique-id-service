@@ -6,7 +6,7 @@ use std::{
     net::UdpSocket,
     path::Path,
     str::Utf8Error,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -21,6 +21,13 @@ fn main() -> Result<()> {
         .context("failed to open the store file")?;
     let mut ids = BufReader::new(&store)
         .lines()
+        .map(|line| {
+            line.map_err(anyhow::Error::new).and_then(|line| {
+                let mut parts = line.split('|');
+                parts.next().context("invalid store")?;
+                Ok(parts.next().context("invalid store")?.to_owned())
+            })
+        })
         .collect::<Result<_, _>>()
         .context("failed to read store")?;
 
@@ -150,7 +157,11 @@ fn generate_id(ids: &mut HashSet<String>, store: &mut File) -> Result<String, Er
     while Instant::now() <= end {
         let id = nanoid!(10, &HEX_LOWERCASE);
         if ids.insert(id.clone()) {
-            writeln!(store, "{id}").map_err(Error::StoreWrite)?;
+            let creation = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            writeln!(store, "{creation}|{id}").map_err(Error::StoreWrite)?;
             store.sync_data().map_err(Error::StoreSync)?;
             return Ok(id);
         }
