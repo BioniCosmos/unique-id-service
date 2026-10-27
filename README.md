@@ -3,9 +3,9 @@
 Obtain a unique id via DNS request.
 
 ```shell-session
-$ dig -p 3000
+$ dig -p 3000 id TXT
 
-; <<>> DiG 9.20.30 <<>> -p 3000
+; <<>> DiG 9.20.30 <<>> -p 3000 id TXT
 ; (1 server found)
 ;; global options: +cmd
 ;; Got answer:
@@ -14,14 +14,14 @@ $ dig -p 3000
 ;; WARNING: recursion requested but not available
 
 ;; QUESTION SECTION:
-;.				IN	NS
+;id.				                    IN	    TXT
 
 ;; ANSWER SECTION:
-.			0	IN	TXT	"05ce7a15f2"
+id.			                0	      IN	    TXT	    "05ce7a15f2"
 
 ;; Query time: 7 msec
 ;; SERVER: 127.0.0.1#3000(127.0.0.1) (UDP)
 ;; WHEN: Wed Oct 21 13:03:58 UTC 2026
-;; MSG SIZE  rcvd: 39
+;; MSG SIZE  rcvd: 45
 
 ```

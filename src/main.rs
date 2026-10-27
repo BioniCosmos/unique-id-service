@@ -1,15 +1,15 @@
 use std::{
     collections::HashSet,
-    env, error,
+    env,
     fs::File,
-    io::{BufRead, BufReader, Write as _},
+    io::{self, BufRead, BufReader, Write as _},
     net::UdpSocket,
     path::Path,
     str::Utf8Error,
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use nanoid::{alphabet::HEX_LOWERCASE, nanoid};
 
 fn main() -> Result<()> {
@@ -42,54 +42,120 @@ fn handle(
     buf: &mut [u8],
     ids: &mut HashSet<String>,
     store: &mut File,
-) -> Result<()> {
-    let (n, addr) = socket.recv_from(buf).context("failed to receive")?;
+) -> Result<(), Error> {
+    macro_rules! res_header {
+        ($header:expr, $rcode:expr, $qdcount:expr, $ancount:expr) => {
+            Header {
+                id: $header.id,
+                qr: Type::Response,
+                opcode: $header.opcode,
+                aa: true,
+                tc: false,
+                rd: $header.rd,
+                ra: false,
+                rcode: $rcode,
+                qdcount: $qdcount,
+                ancount: $ancount,
+                nscount: 0,
+                arcount: 0,
+            }
+        };
+    }
+
+    let (n, addr) = socket.recv_from(buf).map_err(Error::Receive)?;
+
     let Message {
         header, question, ..
-    } = deserialize(&buf[..n])?;
-    let id = generate_id(ids, store)?;
+    } = match deserialize(&buf[..n]) {
+        Ok(x) => x,
+        Err(e @ Error::InvalidDomain(_, header)) => {
+            let (n, res) = serialize(&Message {
+                header: res_header!(header, 1, 0, 0),
+                question: None,
+                answer: None,
+            })
+            .unwrap();
+            if let Err(e) = socket.send_to(&res[..n], addr) {
+                eprintln!("failed to send back error response after error occurred: {e}");
+            }
+            return Err(e);
+        }
+        _ => unreachable!(),
+    };
+
+    if header.qr != Type::Query {
+        return Err(Error::InvalidType);
+    }
+    if header.opcode != 0 {
+        let (n, res) = serialize(&Message {
+            header: res_header!(header, 4, 1, 0),
+            question,
+            answer: None,
+        })
+        .unwrap();
+        if let Err(e) = socket.send_to(&res[..n], addr) {
+            eprintln!("failed to send back error response after error occurred: {e}");
+        }
+        return Err(Error::UnsupportedQuery(header.opcode));
+    }
+
     let question = question.unwrap();
+    if question.qname != "id" {
+        let (n, res) = serialize(&Message {
+            header: res_header!(header, 3, 1, 0),
+            question: Some(question),
+            answer: None,
+        })
+        .unwrap();
+        return socket
+            .send_to(&res[..n], addr)
+            .and(Ok(()))
+            .map_err(Error::Send);
+    }
+    if question.qtype != 16 {
+        let (n, res) = serialize(&Message {
+            header: res_header!(header, 0, 1, 0),
+            question: Some(question),
+            answer: None,
+        })
+        .unwrap();
+        return socket
+            .send_to(&res[..n], addr)
+            .and(Ok(()))
+            .map_err(Error::Send);
+    }
+
+    let id = generate_id(ids, store)?;
     let (n, res) = serialize(&Message {
-        header: Header {
-            id: header.id,
-            qr: Type::Response,
-            opcode: header.opcode,
-            aa: true,
-            tc: false,
-            rd: header.rd,
-            ra: false,
-            rcode: 0,
-            qdcount: 1,
-            ancount: 1,
-            nscount: 0,
-            arcount: 0,
-        },
+        header: res_header!(header, 0, 1, 1),
         question: Some(question.clone()),
         answer: Some(Record {
             name: question.qname,
             r#type: 16,
             class: question.qclass,
             ttl: 0,
-            rdlength: u16::try_from(id.len() + 1)
-                .map_err(|_| anyhow!("max resource record data size exceeded"))?,
+            rdlength: (id.len() + 1) as u16,
             rdata: id,
         }),
-    })?;
-    socket.send_to(&res[..n], addr)?;
-    Ok(())
+    })
+    .unwrap();
+    socket
+        .send_to(&res[..n], addr)
+        .and(Ok(()))
+        .map_err(Error::Send)
 }
 
-fn generate_id(ids: &mut HashSet<String>, store: &mut File) -> Result<String> {
+fn generate_id(ids: &mut HashSet<String>, store: &mut File) -> Result<String, Error> {
     let end = Instant::now() + Duration::from_secs(2);
     while Instant::now() <= end {
         let id = nanoid!(10, &HEX_LOWERCASE);
         if ids.insert(id.clone()) {
-            writeln!(store, "{id}").context("failed to write to store")?;
-            store.sync_data().context("failed to sync to store")?;
+            writeln!(store, "{id}").map_err(Error::StoreWrite)?;
+            store.sync_data().map_err(Error::StoreSync)?;
             return Ok(id);
         }
     }
-    Err(anyhow!("generation time exceeded"))
+    Err(Error::PoolFull)
 }
 
 #[derive(Debug)]
@@ -100,7 +166,7 @@ struct Message {
     answer: Option<Record>,
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 #[allow(unused)]
 struct Header {
     id: u16,
@@ -117,7 +183,7 @@ struct Header {
     arcount: u16,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 enum Type {
     Query,
     Response,
@@ -143,21 +209,44 @@ struct Record {
 
 #[derive(Debug)]
 enum Error {
-    InvalidDomain(Utf8Error),
+    Receive(io::Error),
+    Send(io::Error),
+    InvalidDomain(Utf8Error, Header),
+    InvalidType,
+    UnsupportedQuery(u8),
+    StoreWrite(io::Error),
+    StoreSync(io::Error),
+    PoolFull,
 }
 
 impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        use Error::*;
         match self {
-            Error::InvalidDomain(e) => Some(e),
+            Receive(e) => Some(e),
+            Send(e) => Some(e),
+            InvalidDomain(e, ..) => Some(e),
+            InvalidType => None,
+            UnsupportedQuery(_) => None,
+            StoreWrite(e) => Some(e),
+            StoreSync(e) => Some(e),
+            PoolFull => None,
         }
     }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Error::*;
         match self {
-            Error::InvalidDomain(_) => write!(f, "invalid domain name in `QNAME`"),
+            Receive(_) => write!(f, "failed to receive message"),
+            Send(_) => write!(f, "failed to send message"),
+            InvalidDomain(..) => write!(f, "invalid domain name in `QNAME`"),
+            InvalidType => write!(f, "Invalid message type/`QR`: the request is a “response”."),
+            UnsupportedQuery(opcode) => write!(f, "unsupported query type/`OPCODE`: `{opcode}`"),
+            StoreWrite(_) => write!(f, "failed to write to store"),
+            StoreSync(_) => write!(f, "failed to sync to store"),
+            PoolFull => write!(f, "generation time exceeded"),
         }
     }
 }
@@ -198,7 +287,10 @@ fn deserialize(raw: &[u8]) -> Result<Message, Error> {
                 if len == 0 {
                     break;
                 }
-                segments.push(str::from_utf8(&raw[i..i + len]).map_err(Error::InvalidDomain)?);
+                segments.push(
+                    str::from_utf8(&raw[i..i + len])
+                        .map_err(|e| Error::InvalidDomain(e, header))?,
+                );
                 i += len;
             }
             segments.join(".")
